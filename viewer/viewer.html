@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ClickUp Backup Viewer</title>
+
+  <!-- Bootstrap 5 (CDN) -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+
+  <style>
+    body { background: #f8f9fa; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .task-card { border-left: 6px solid #dee2e6; }
+
+    .truncate-2 {
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        line-clamp: 2;
+        overflow: hidden;
+    }
+
+    .pre-wrap { white-space: pre-wrap; word-break: break-word; }
+    img.thumb { max-width: 260px; height: auto; border-radius: .5rem; border: 1px solid #dee2e6; background: #fff; }
+    .sticky-top-controls { position: sticky; top: 0; z-index: 1020; background: #f8f9fa; padding-top: .75rem; padding-bottom: .75rem; border-bottom: 1px solid #dee2e6; }
+  </style>
+</head>
+
+<body>
+  <div class="sticky-top-controls">
+    <div class="container">
+      <div class="d-flex flex-wrap align-items-center gap-2">
+        <div class="me-auto">
+          <div class="h4 mb-0">ClickUp Backup Viewer</div>
+          <div class="text-muted small">Drop this file into a backup folder, then load the JSON.</div>
+        </div>
+
+        <div class="d-flex flex-wrap align-items-center gap-2">
+          <label class="btn btn-outline-primary mb-0">
+            Choose backup JSON
+            <input id="fileInput" type="file" accept=".json,application/json" hidden>
+          </label>
+          <input id="searchInput" class="form-control" style="min-width: 260px;" type="search" placeholder="Search tasks (name, status, description, comments)" />
+        </div>
+      </div>
+
+      <div id="statusBar" class="mt-2 small text-muted"></div>
+    </div>
+  </div>
+
+  <div class="container my-4">
+    <div id="summary" class="mb-3"></div>
+    <div id="content"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+
+  <script>
+    const el = (tag, attrs = {}, children = []) => {
+      const node = document.createElement(tag);
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k === "class") node.className = v;
+        else if (k === "text") node.textContent = v;
+        else if (k.startsWith("data-")) node.setAttribute(k, v);
+        else if (k === "html") node.innerHTML = v; // use sparingly
+        else node.setAttribute(k, v);
+      }
+      for (const ch of children) node.appendChild(ch);
+      return node;
+    };
+
+    const byId = (id) => document.getElementById(id);
+
+    const statusBar = (msg, isError = false) => {
+      const sb = byId("statusBar");
+      sb.textContent = msg;
+      sb.classList.toggle("text-danger", !!isError);
+      sb.classList.toggle("text-muted", !isError);
+    };
+
+    const safeInt = (x) => {
+      if (x === null || x === undefined) return null;
+      const n = Number.parseInt(String(x), 10);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const fmtMs = (msLike) => {
+      const ms = safeInt(msLike);
+      if (!ms) return "—";
+      try {
+        const d = new Date(ms);
+        if (Number.isNaN(d.getTime())) return "—";
+        return d.toLocaleString();
+      } catch {
+        return "—";
+      }
+    };
+
+    const textOrDash = (v) => (v === null || v === undefined || v === "" ? "—" : String(v));
+
+    const uniqId = (() => {
+      let i = 0;
+      return (prefix) => `${prefix}_${Date.now()}_${++i}`;
+    })();
+
+    // Global state for search filtering
+    let taskIndex = []; // {node, haystack}
+    let currentData = null;
+
+    const buildStatusBadge = (statusObj) => {
+      const s = statusObj?.status ?? "unknown";
+      const color = statusObj?.color ?? "#6c757d";
+      const badge = el("span", { class: "badge rounded-pill me-2", text: s });
+      badge.style.backgroundColor = color;
+      return badge;
+    };
+
+    const renderKeyValueRow = (k, v, mono=false) => {
+      return el("div", { class: "d-flex gap-2 small" }, [
+        el("div", { class: "text-muted", text: k + ":" }),
+        el("div", { class: mono ? "mono" : "", text: textOrDash(v) })
+      ]);
+    };
+
+    const renderPersonList = (label, arr) => {
+      if (!Array.isArray(arr) || arr.length === 0) return renderKeyValueRow(label, "—");
+      const names = arr.map(p => p?.username || p?.email || p?.id).filter(Boolean);
+      return renderKeyValueRow(label, names.join(", "));
+    };
+
+    const renderAttachments = (task) => {
+      const attachments = Array.isArray(task.attachments) ? task.attachments : [];
+      if (!attachments.length) return el("div", { class: "text-muted small", text: "No attachments." });
+
+      const wrap = el("div", { class: "d-flex flex-column gap-2" });
+
+      for (const a of attachments) {
+        const local = a?.local_file;
+        const title = a?.title || a?.name || a?.id || "attachment";
+        const ext = (a?.extension || "").toLowerCase();
+
+        const row = el("div", { class: "p-2 bg-white border rounded" });
+
+        row.appendChild(el("div", { class: "fw-semibold", text: title }));
+        row.appendChild(el("div", { class: "small text-muted mono", text: local ? local : (a?.url || "—") }));
+
+        // Show thumbnail for images if local path is available
+        if (local && (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "gif" || ext === "webp")) {
+          const img = el("img", { class: "thumb mt-2", src: local, alt: title, loading: "lazy" });
+          img.addEventListener("error", () => {
+            // If the file can't be loaded (bad relative path / blocked), degrade gracefully
+            img.replaceWith(el("div", { class: "small text-muted mt-2", text: "Image preview unavailable (path blocked or not found)." }));
+          });
+          row.appendChild(img);
+        }
+
+        if (local) {
+          row.appendChild(el("div", { class: "mt-2" }, [
+            el("a", { class: "btn btn-sm btn-outline-secondary", href: local, target: "_blank", text: "Open local file" })
+          ]));
+        } else if (a?.url) {
+          row.appendChild(el("div", { class: "mt-2" }, [
+            el("a", { class: "btn btn-sm btn-outline-secondary", href: a.url, target: "_blank", text: "Open remote URL" })
+          ]));
+        }
+
+        wrap.appendChild(row);
+      }
+
+      return wrap;
+    };
+
+    const renderComments = (task, attachmentTitleToLocal) => {
+      const comments = Array.isArray(task.comments) ? task.comments : [];
+      if (!comments.length) return el("div", { class: "text-muted small", text: "No comments." });
+
+      // Sort oldest -> newest if possible
+      const sorted = [...comments].sort((a, b) => (safeInt(a?.date) ?? 0) - (safeInt(b?.date) ?? 0));
+
+      const list = el("div", { class: "d-flex flex-column gap-2" });
+
+      for (const c of sorted) {
+        const author = c?.user?.username || c?.user?.email || "Unknown";
+        const dt = fmtMs(c?.date);
+        const text = c?.comment_text || "";
+
+        const card = el("div", { class: "p-2 bg-white border rounded" });
+        card.appendChild(el("div", { class: "d-flex justify-content-between align-items-center" }, [
+          el("div", { class: "fw-semibold", text: author }),
+          el("div", { class: "small text-muted", text: dt })
+        ]));
+
+        const body = el("div", { class: "pre-wrap mt-1" });
+        body.textContent = textOrDash(text);
+        card.appendChild(body);
+
+        // If the comment text looks like it references an attachment title, link it
+        const key = (text || "").trim();
+        const local = attachmentTitleToLocal.get(key);
+        if (local) {
+          const linkRow = el("div", { class: "mt-2" }, [
+            el("a", { class: "btn btn-sm btn-outline-secondary", href: local, target: "_blank", text: "Open referenced attachment" })
+          ]);
+          card.appendChild(linkRow);
+        }
+
+        list.appendChild(card);
+      }
+
+      return list;
+    };
+
+    
+const renderTask = (task, parentAccId) => {
+  const tId = String(task?.id ?? "");
+  const tName = task?.name ?? "(unnamed task)";
+  const statusObj = task?.status;
+
+  // Map attachment title -> local_file for comment linking
+  const attachmentTitleToLocal = new Map();
+  const attachments = Array.isArray(task.attachments) ? task.attachments : [];
+  for (const a of attachments) {
+    const title = (a?.title || a?.name || "").trim();
+    const local = a?.local_file;
+    if (title && local) attachmentTitleToLocal.set(title, local);
+  }
+
+  // Build the expanded body
+  const meta = el("div", { class: "mt-2 d-flex flex-column gap-1" }, [
+    renderKeyValueRow("Created", fmtMs(task?.date_created)),
+    renderKeyValueRow("Updated", fmtMs(task?.date_updated)),
+    renderKeyValueRow("Done", fmtMs(task?.date_done)),
+    renderKeyValueRow("Closed", fmtMs(task?.date_closed)),
+    renderPersonList("Assignees", task?.assignees),
+    renderPersonList("Watchers", task?.watchers),
+  ]);
+
+  const desc = (task?.description || task?.text_content || "").trim();
+  const descBox = el("div", { class: "mt-2" }, [
+    el("div", { class: "text-muted small fw-semibold", text: "Description" }),
+    el("div", { class: "p-2 bg-white border rounded pre-wrap", text: desc || "—" })
+  ]);
+
+  // Inner accordion (Comments / Attachments / Raw)
+  const innerAccId = uniqId("taskAcc");
+  const inner = el("div", { class: "accordion mt-3", id: innerAccId });
+
+  const addInnerItem = (title, bodyNode) => {
+    const collapseId = uniqId("collapse");
+    const hId = uniqId("heading");
+
+    const item = el("div", { class: "accordion-item" });
+    const h = el("h2", { class: "accordion-header", id: hId });
+    const btn = el("button", {
+      class: "accordion-button collapsed",
+      type: "button",
+      "data-bs-toggle": "collapse",
+      "data-bs-target": `#${collapseId}`,
+      "aria-expanded": "false",
+      "aria-controls": collapseId,
+      text: title
+    });
+    h.appendChild(btn);
+
+    const c = el("div", {
+      id: collapseId,
+      class: "accordion-collapse collapse",
+      "aria-labelledby": hId,
+      "data-bs-parent": `#${innerAccId}`
+    });
+
+    const b = el("div", { class: "accordion-body" });
+    b.appendChild(bodyNode);
+    c.appendChild(b);
+
+    item.appendChild(h);
+    item.appendChild(c);
+    inner.appendChild(item);
+  };
+
+  addInnerItem(`Comments (${Array.isArray(task.comments) ? task.comments.length : 0})`, renderComments(task, attachmentTitleToLocal));
+  addInnerItem(`Attachments (${Array.isArray(task.attachments) ? task.attachments.length : 0})`, renderAttachments(task));
+
+  const raw = el("pre", { class: "bg-light border rounded p-2 small mono pre-wrap" });
+  raw.textContent = JSON.stringify(task, null, 2);
+  addInnerItem("Raw task JSON", raw);
+
+  // Optional quick actions
+  const actions = el("div", { class: "mt-2 d-flex flex-wrap gap-2" }, []);
+  if (task?.url) {
+    actions.appendChild(el("a", { class: "btn btn-sm btn-outline-primary", href: task.url, target: "_blank", text: "Open in ClickUp" }));
+  }
+
+  // Build the OUTER task accordion item
+  const taskAccItem = el("div", { class: "accordion-item" });
+
+  const headingId = uniqId("taskHeading");
+  const collapseId = uniqId("taskCollapse");
+
+  const header = el("h2", { class: "accordion-header", id: headingId });
+
+  const btn = el("button", {
+    class: "accordion-button collapsed",
+    type: "button",
+    "data-bs-toggle": "collapse",
+    "data-bs-target": `#${collapseId}`,
+    "aria-expanded": "false",
+    "aria-controls": collapseId
+  });
+
+  // Header content: status badge + name + id (only what you see before expanding)
+  btn.appendChild(buildStatusBadge(statusObj));
+  btn.appendChild(el("span", { class: "fw-semibold", text: tName }));
+  if (tId) btn.appendChild(el("span", { class: "ms-2 small text-muted mono", text: `#${tId}` }));
+
+  header.appendChild(btn);
+
+  const collapse = el("div", {
+    id: collapseId,
+    class: "accordion-collapse collapse",
+    "aria-labelledby": headingId,
+    ...(parentAccId ? { "data-bs-parent": `#${parentAccId}` } : {})
+  });
+
+  // Inside expanded body, keep “card-like” styling
+  const body = el("div", { class: "accordion-body" });
+
+  const card = el("div", { class: "card task-card" });
+  if (statusObj?.color) card.style.borderLeftColor = statusObj.color;
+
+  const cardBody = el("div", { class: "card-body" }, [
+    meta,
+    descBox,
+    actions,
+    inner
+  ]);
+
+  card.appendChild(cardBody);
+  body.appendChild(card);
+  collapse.appendChild(body);
+
+  taskAccItem.appendChild(header);
+  taskAccItem.appendChild(collapse);
+
+  // Search haystack (unchanged)
+  const haystackParts = [
+    tName,
+    statusObj?.status,
+    desc,
+    ...(Array.isArray(task.comments) ? task.comments.map(c => c?.comment_text || "") : []),
+    ...(Array.isArray(task.tags) ? task.tags.map(t => t?.name || "") : [])
+  ].filter(Boolean);
+
+  const haystack = haystackParts.join(" ").toLowerCase();
+
+  return { node: taskAccItem, haystack };
+};
+
+    // add near your helpers (optional but useful)
+const safeFloat = (x) => {
+  if (x === null || x === undefined) return null;
+  const n = Number.parseFloat(String(x));
+  return Number.isFinite(n) ? n : null;
+};
+
+const normalizeStatusLabel = (s) => {
+  const t = String(s || "unknown").trim();
+  return t ? t : "unknown";
+};
+
+
+const renderList = (listObj) => {
+  const listName = listObj?.name ?? "(unnamed list)";
+  const tasks = Array.isArray(listObj?.tasks) ? listObj.tasks : [];
+
+  const wrapper = el("div", { class: "p-2" });
+
+  // Status definitions from list metadata (best ordering + colors)
+  const statusDefs = Array.isArray(listObj?.metadata?.statuses) ? listObj.metadata.statuses : [];
+
+  const defById = new Map();
+  const defByLabel = new Map();
+  for (const d of statusDefs) {
+    if (d?.id) defById.set(String(d.id), d);
+    if (d?.status) defByLabel.set(String(d.status).toLowerCase(), d);
+  }
+
+  // Group tasks by status
+  const groups = new Map(); // key -> { label, color, order, tasks: [] }
+
+  for (const t of tasks) {
+    const tStatusId = t?.status?.id ? String(t.status.id) : null;
+    const tStatusLabelRaw = normalizeStatusLabel(t?.status?.status);
+    const tStatusLabelKey = tStatusLabelRaw.toLowerCase();
+
+    // Prefer matching by status.id, then by status label
+    const def = (tStatusId && defById.get(tStatusId)) || defByLabel.get(tStatusLabelKey);
+
+    const label = normalizeStatusLabel(def?.status ?? tStatusLabelRaw);
+    const key = label.toLowerCase();
+    const color = def?.color ?? t?.status?.color ?? "#6c757d";
+
+    // Use metadata orderindex if available; else fall back to task status orderindex; else Infinity
+    const order =
+      safeFloat(def?.orderindex) ??
+      safeFloat(t?.status?.orderindex) ??
+      Number.POSITIVE_INFINITY;
+
+    if (!groups.has(key)) groups.set(key, { label, color, order, tasks: [] });
+    groups.get(key).tasks.push(t);
+  }
+
+  // Chips summary (quick glance)
+  const chips = el("div", { class: "d-flex flex-wrap gap-2 mb-2" });
+  const sortedForChips = [...groups.values()].sort((a, b) => (a.order - b.order) || a.label.localeCompare(b.label));
+  for (const g of sortedForChips) {
+    const chip = el("span", { class: "badge text-bg-light border" });
+    const dot = el("span", { class: "me-1" });
+    dot.style.display = "inline-block";
+    dot.style.width = "10px";
+    dot.style.height = "10px";
+    dot.style.borderRadius = "999px";
+    dot.style.backgroundColor = g.color;
+    chip.appendChild(dot);
+    chip.appendChild(document.createTextNode(`${g.label}: ${g.tasks.length}`));
+    chips.appendChild(chip);
+  }
+  wrapper.appendChild(chips);
+
+  // Status accordion (new level)
+  const statusAccId = uniqId("statusAcc");
+  const statusAcc = el("div", { class: "accordion", id: statusAccId });
+
+  // Order: use metadata order when possible, then remaining alphabetical
+  // (We already set g.order from metadata when matched)
+  const orderedGroups = [...groups.values()].sort((a, b) => (a.order - b.order) || a.label.localeCompare(b.label));
+
+  for (const g of orderedGroups) {
+    const collapseId = uniqId("statusCollapse");
+    const headingId = uniqId("statusHeading");
+
+    const item = el("div", { class: "accordion-item" });
+
+    const h = el("h2", { class: "accordion-header", id: headingId });
+    const btn = el("button", {
+      class: "accordion-button collapsed",
+      type: "button",
+      "data-bs-toggle": "collapse",
+      "data-bs-target": `#${collapseId}`,
+      "aria-expanded": "false",
+      "aria-controls": collapseId,
+    });
+
+    // Build a nicer header: colored badge + label + count
+    const badge = el("span", { class: "badge rounded-pill me-2", text: g.label });
+    badge.style.backgroundColor = g.color;
+
+    btn.appendChild(badge);
+    btn.appendChild(document.createTextNode(` ${g.tasks.length} task(s)`));
+    h.appendChild(btn);
+
+    const c = el("div", {
+      id: collapseId,
+      class: "accordion-collapse collapse",
+      "aria-labelledby": headingId,
+      "data-bs-parent": `#${statusAccId}`
+    });
+
+    const b = el("div", { class: "accordion-body" });
+
+    // Render tasks in this status group (as their own accordion)
+    const tasksAccId = uniqId("tasksAcc");
+    const tasksAcc = el("div", { class: "accordion", id: tasksAccId });
+
+    for (const t of g.tasks) {
+    const rendered = renderTask(t, tasksAccId); // <-- pass parent accordion id
+    tasksAcc.appendChild(rendered.node);
+    taskIndex.push(rendered); // keep search working
+    }
+
+    b.appendChild(tasksAcc);
+
+    c.appendChild(b);
+    item.appendChild(h);
+    item.appendChild(c);
+    statusAcc.appendChild(item);
+  }
+
+  // If no tasks, show a small note
+  if (!tasks.length) {
+    wrapper.appendChild(el("div", { class: "text-muted small", text: "No tasks in this list." }));
+  } else {
+    wrapper.appendChild(statusAcc);
+  }
+
+  return wrapper;
+};
+
+    const renderSpace = (data) => {
+      currentData = data;
+      taskIndex = [];
+
+      const content = byId("content");
+      const summary = byId("summary");
+      content.innerHTML = "";
+      summary.innerHTML = "";
+
+      const name = data?.name || "(unnamed space)";
+      const id = data?.id || "—";
+      const backupDate = data?.backup_date || "—";
+      const stats = data?.backup_stats || {};
+
+      summary.appendChild(
+        el("div", { class: "card" }, [
+          el("div", { class: "card-body" }, [
+            el("div", { class: "d-flex flex-wrap justify-content-between align-items-start gap-2" }, [
+              el("div", {}, [
+                el("div", { class: "h5 mb-1", text: name }),
+                el("div", { class: "text-muted small mono", text: `Space ID: ${id}` }),
+                el("div", { class: "text-muted small", text: `Backup date: ${backupDate}` }),
+              ]),
+              el("div", { class: "d-flex flex-wrap gap-2" }, [
+                el("span", { class: "badge text-bg-light border", text: `Lists: ${stats.total_lists ?? "—"}` }),
+                el("span", { class: "badge text-bg-light border", text: `Tasks: ${stats.total_tasks ?? "—"}` }),
+                el("span", { class: "badge text-bg-light border", text: `Attachments: ${stats.total_attachments ?? "—"}` }),
+              ])
+            ])
+          ])
+        ])
+      );
+
+      // Lists accordion
+      const lists = Array.isArray(data?.lists) ? data.lists : [];
+      const accId = uniqId("listsAcc");
+      const acc = el("div", { class: "accordion", id: accId });
+
+      for (const l of lists) {
+        const itemId = uniqId("listItem");
+        const collapseId = uniqId("listCollapse");
+        const headingId = uniqId("listHeading");
+
+        const listName = l?.name ?? "(unnamed list)";
+        const taskCount = Array.isArray(l?.tasks) ? l.tasks.length : (l?.task_count ?? 0);
+
+        const item = el("div", { class: "accordion-item" });
+
+        const h = el("h2", { class: "accordion-header", id: headingId });
+        const btn = el("button", {
+          class: "accordion-button collapsed",
+          type: "button",
+          "data-bs-toggle": "collapse",
+          "data-bs-target": `#${collapseId}`,
+          "aria-expanded": "false",
+          "aria-controls": collapseId,
+          text: `${listName} (${taskCount})`
+        });
+        h.appendChild(btn);
+
+        const c = el("div", {
+          id: collapseId,
+          class: "accordion-collapse collapse",
+          "aria-labelledby": headingId,
+          "data-bs-parent": `#${accId}`
+        });
+
+        const b = el("div", { class: "accordion-body" });
+        b.appendChild(renderList(l));
+        c.appendChild(b);
+
+        item.appendChild(h);
+        item.appendChild(c);
+        acc.appendChild(item);
+      }
+
+      content.appendChild(acc);
+
+      statusBar(`Loaded space "${name}" with ${taskIndex.length} tasks.`);
+      applySearchFilter(byId("searchInput").value || "");
+    };
+
+    const expandIfContainsVisibleTasks = () => {
+    // Expand any status-group collapse that contains at least one visible task accordion-item
+        const statusCollapses = document.querySelectorAll(".accordion-collapse");
+        for (const c of statusCollapses) {
+            // Only target status-level collapses (heuristic: they contain a tasks accordion)
+            const hasTasksAccordion = c.querySelector(".accordion[id^='tasksAcc_']");
+            if (!hasTasksAccordion) continue;
+
+            const hasVisibleTask = !!c.querySelector(".accordion-item:not(.d-none)");
+            const bs = bootstrap.Collapse.getOrCreateInstance(c, { toggle: false });
+
+            if (hasVisibleTask) bs.show();
+            else bs.hide();
+        }
+    };
+
+    const applySearchFilter = (q) => {
+        const query = (q || "").trim().toLowerCase();
+
+        if (!query) {
+            for (const t of taskIndex) t.node.classList.remove("d-none");
+            statusBar(currentData ? `Loaded space "${currentData.name || ""}" with ${taskIndex.length} tasks.` : "Ready.");
+
+            // optional: restore “reasonable” visibility after clearing search
+            // expandIfContainsVisibleTasks(); // will open status groups that contain visible tasks (i.e., all)
+            return;
+        }
+
+        let shown = 0;
+        for (const t of taskIndex) {
+            const hit = t.haystack.includes(query);
+            t.node.classList.toggle("d-none", !hit);
+            if (hit) shown++;
+        }
+
+        statusBar(`Filter: "${query}" → showing ${shown}/${taskIndex.length} tasks.`);
+        expandIfContainsVisibleTasks();
+    };
+
+    const loadJsonFromFile = (file) => {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const data = JSON.parse(reader.result);
+            resolve(data);
+          } catch (e) {
+            reject(e);
+          }
+        };
+        reader.onerror = () => reject(reader.error);
+        reader.readAsText(file);
+      });
+    };
+
+    const tryFetchJson = async (path) => {
+      const r = await fetch(path, { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status} for ${path}`);
+      return await r.json();
+    };
+
+    // Wire up UI
+    byId("fileInput").addEventListener("change", async (ev) => {
+      const f = ev.target.files && ev.target.files[0];
+      if (!f) return;
+      try {
+        statusBar(`Reading ${f.name}...`);
+        const data = await loadJsonFromFile(f);
+        renderSpace(data);
+      } catch (e) {
+        console.error(e);
+        statusBar(`Failed to read/parse JSON: ${e?.message || e}`, true);
+      }
+    });
+
+    byId("btnTryAuto").addEventListener("click", async () => {
+      // Most useful if you also write a stable "backup.json" in each backup dir
+      const candidates = ["backup.json", ...Array.from({length: 5}, (_, i) => `backup_${i}.json`)]; // silly fallback
+      statusBar("Trying to auto-load backup.json (works best via http://) ...");
+      for (const c of candidates) {
+        try {
+          const data = await tryFetchJson(c);
+          renderSpace(data);
+          return;
+        } catch (_) {}
+      }
+      statusBar("Auto-load failed. Use the file picker (recommended for file://).", true);
+    });
+
+    byId("searchInput").addEventListener("input", (ev) => {
+      applySearchFilter(ev.target.value);
+    });
+
+    // Initial hint
+    statusBar("Choose a backup JSON file to begin. If you run a local server, you can also try auto-load.");
+  </script>
+</body>
+</html>
